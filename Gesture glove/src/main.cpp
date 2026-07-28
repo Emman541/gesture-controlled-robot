@@ -3,27 +3,42 @@
 #include <esp_now.h>
 #include <WiFi.h>
 
-#define I2C_SDA 8
+// PIN DEF
+#define I2C_SDA 10
 #define I2C_SCL 9
-const int MPU_ADDR = 0x68;
+#define RGB_LED_PIN 8
 
-// Sensitivity adjustment (Lower = more sensitive, Higher = less sensitive)
-int TILT_THRESHOLD = 8000;
+// Tilt sensitivities
+// Lower number = more sensitive. Higher number = Less sensitive
+int TILT_FORWARD  = 6000; 
+int TILT_BACKWARD = 8000;
+int TILT_LEFT     = 8000;
+int TILT_RIGHT    = 8000;
 
-// Receiver address
+// The absolute maximum tilt before it hit 100% top speed
+int MAX_TILT = 16000; 
+
+// The minimum PWM required to make the motors physically spin (0-255)
+int MIN_SPEED = 100; 
+
+// MAC address of Receiver ESP (ESP32-U in the Car)
 uint8_t carAddress[] = {0xB4, 0xBF, 0xE9, 0x10, 0xFA, 0xA8};
 
+// Data packet
 typedef struct struct_message {
   char direction; 
+  int speed; //Holds the calculated 0-255 speed value
 } struct_message;
 
 struct_message commandData;
 esp_now_peer_info_t peerInfo;
 
-// Callback to check delivery status
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  Serial.print("Delivery: ");
-  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "SUCCESS" : "FAIL");
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    neopixelWrite(RGB_LED_PIN, 0, 40, 0); // Green if connected
+  } else {
+    neopixelWrite(RGB_LED_PIN, 40, 0, 0); // Red if disconnected
+  }
 }
 
 void setup() {
@@ -31,65 +46,65 @@ void setup() {
   delay(2000); 
   
   Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.beginTransmission(MPU_ADDR);
+  Wire.beginTransmission(0x68);
   Wire.write(0x6B); 
   Wire.write(0);    
   Wire.endTransmission();
   
   WiFi.mode(WIFI_STA);
 
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("Error initializing ESP-NOW");
-    return;
-  }
-
+  if (esp_now_init() != ESP_OK) return;
   esp_now_register_send_cb(OnDataSent);
   
   memcpy(peerInfo.peer_addr, carAddress, 6);
   peerInfo.channel = 0;  
   peerInfo.encrypt = false;
   
-  if (esp_now_add_peer(&peerInfo) != ESP_OK){
-    Serial.println("Failed to add peer");
-    return;
-  }
-  
-  Serial.println("Gesture Transmitter Locked onto Car!");
+  esp_now_add_peer(&peerInfo);
+  neopixelWrite(RGB_LED_PIN, 0, 0, 40); // Boot-up Blue
 }
 
 void loop() {
-  Wire.beginTransmission(MPU_ADDR);
+  Wire.beginTransmission(0x68);
   Wire.write(0x3B); 
   Wire.endTransmission(false);
-  Wire.requestFrom(MPU_ADDR, 14, true); 
+  Wire.requestFrom(0x68, 14, true); 
 
   if (Wire.available() == 14) {
     int16_t AcX = Wire.read() << 8 | Wire.read();
     int16_t AcY = Wire.read() << 8 | Wire.read();
-    int16_t AcZ = Wire.read() << 8 | Wire.read();
-    int16_t Tmp = Wire.read() << 8 | Wire.read(); 
-    int16_t GyX = Wire.read() << 8 | Wire.read();
-    int16_t GyY = Wire.read() << 8 | Wire.read();
-    int16_t GyZ = Wire.read() << 8 | Wire.read();
+    
+    // Ignore Z-axis and Gyro for basic tilt logic
+    for(int i=0; i<10; i++) Wire.read(); 
 
-    commandData.direction = 'S'; // Default to STOP
+    commandData.direction = 'S'; 
+    commandData.speed = 0;
 
-    // Apply Logic(For direction)
-    if (AcX > TILT_THRESHOLD) {
-      commandData.direction = 'R';        
-    } else if (AcX < -TILT_THRESHOLD) {
-      commandData.direction = 'L';        
-    } else if (AcY < -TILT_THRESHOLD) {
+    // Apply Orientation Logic and Map Speed dynamically
+    if (AcY < -TILT_FORWARD) {
       commandData.direction = 'F';        
-    } else if (AcY > TILT_THRESHOLD) {
+      commandData.speed = map(-AcY, TILT_FORWARD, MAX_TILT, MIN_SPEED, 255);
+    } 
+    else if (AcY > TILT_BACKWARD) {
       commandData.direction = 'B';        
+      commandData.speed = map(AcY, TILT_BACKWARD, MAX_TILT, MIN_SPEED, 255);
+    } 
+    else if (AcX > TILT_RIGHT) {
+      commandData.direction = 'L';  
+      commandData.speed = map(AcX, TILT_RIGHT, MAX_TILT, MIN_SPEED, 255);
+    } 
+    else if (AcX < -TILT_LEFT) {
+      commandData.direction = 'R';   
+      commandData.speed = map(-AcX, TILT_LEFT, MAX_TILT, MIN_SPEED, 255);
     }
 
-    Serial.print("Gesture: "); Serial.print(commandData.direction); Serial.print("  |  ");
+    //Prevent math overflow from crashing the PWM signal
+    commandData.speed = constrain(commandData.speed, 0, 255);
 
-    // Send directions to the receiving ESP
+    Serial.print("Cmd: "); Serial.print(commandData.direction); 
+    Serial.print(" | Speed: "); Serial.println(commandData.speed);
+
     esp_now_send(carAddress, (uint8_t *) &commandData, sizeof(commandData));
   }
-  
-  delay(150); 
+  delay(100); // Slightly faster polling for smoother throttle response
 }
